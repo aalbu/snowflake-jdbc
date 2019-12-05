@@ -1063,7 +1063,7 @@ public class SessionUtil
           .setHost(url.getHost())
           .setPath(url.getPath())
           .setParameter("RelayState", "%2Fsome%2Fdeep%2Flink")
-          .setParameter("onetimetoken", oneTimeToken).build();
+          .setParameter("sessionToken", oneTimeToken).build();
       HttpGet httpGet = new HttpGet(oktaGetUri);
 
       HeaderGroup headers = new HeaderGroup();
@@ -1106,12 +1106,12 @@ public class SessionUtil
   throws SnowflakeSQLException
 
   {
-    String oneTimeToken = "";
+    String sessionToken = "";
     try
     {
       URL url = new URL(tokenUrl);
-      URI tokenUri = url.toURI();
-      final HttpPost postRequest = new HttpPost(tokenUri);
+      URI authenticationUri = new URL(url.getProtocol(), url.getHost(), url.getPort(), "/api/v1/authn").toURI();
+      final HttpPost postRequest = new HttpPost(authenticationUri);
 
       String userName;
       if (Strings.isNullOrEmpty(loginInput.getOKTAUserName()))
@@ -1142,15 +1142,44 @@ public class SessionUtil
       logger.debug("user is authenticated against {}.",
                    loginInput.getAuthenticator());
 
-      // session token is in the data field of the returned json response
       final JsonNode jsonNode = mapper.readTree(idpResponse);
-      oneTimeToken = jsonNode.get("cookieToken").asText();
+      String stateToken = jsonNode.get("stateToken").asText();
+      // TODO: _embedded.factors[?(@.factorType == "push")].id
+      String pushFactorId = jsonNode.path("_embedded").path("factors").path(0).get("id").asText();
+
+      // use the state token for MFA
+      URI mfaUri = new URL(url.getProtocol(), url.getHost(), url.getPort(), String.format("/api/v1/authn/factors/%s/verify", pushFactorId)).toURI();
+      HttpPost mfaPostRequest = new HttpPost(mfaUri);
+      mfaPostRequest.setEntity(new StringEntity("{\"stateToken\": \"" + stateToken + "\"}"));
+      mfaPostRequest.setHeaders(headers.getAllHeaders());
+
+      do {
+        final String mfaResponse = HttpUtil.executeRequestWithoutCookies(
+                mfaPostRequest,
+                loginInput.getLoginTimeout(),
+                0,
+                null,
+                loginInput.getOCSPMode());
+        JsonNode mfaJsonNode = mapper.readTree(mfaResponse);
+        if ("SUCCESS".equals(mfaJsonNode.get("status").asText())) {
+          sessionToken = mfaJsonNode.get("sessionToken").asText();
+        }
+        else {
+          try {
+            Thread.sleep(100L);
+          }
+          catch (InterruptedException e) {
+            e.printStackTrace();
+          }
+        }
+      } while ("".equals(sessionToken));
+
     }
     catch (IOException | URISyntaxException ex)
     {
       handleFederatedFlowError(loginInput, ex);
     }
-    return oneTimeToken;
+    return sessionToken;
   }
 
   /**
